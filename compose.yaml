@@ -1,0 +1,15 @@
+services:
+  zigbee2mqtt:
+    image: ghcr.io/koenkk/zigbee2mqtt
+    container_name: zigbee2mqtt
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: Asia/Jakarta
+    volumes:
+      - ./data:/app/data
+      - /run/udev:/run/udev:ro
+    devices:
+      - /dev/serial/by-id/usb-ITead_Sonoff_Zigbee_3.0_USB_Dongle_Plus_3869d3a4478aef119fffbaa3ef8776e9-if00-port0:/dev/ttyUSB0
+    group_add:
+      - dialout

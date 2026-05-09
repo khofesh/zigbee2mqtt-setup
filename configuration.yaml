@@ -1,0 +1,32 @@
+mqtt:
+  base_topic: zigbee2mqtt
+  server: mqtt://localhost:1883
+  password: PASSWORD
+  user: USERNAME
+serial:
+  port: /dev/ttyUSB0
+  adapter: zstack
+  baudrate: 115200
+  rtscts: false
+advanced:
+  # Optional: Zigbee pan ID (default: shown below)
+  # Setting pan_id: GENERATE will make Zigbee2MQTT generate a new panID on next startup
+  pan_id: GENERATE
+  # Optional: Zigbee extended pan ID, GENERATE will make Zigbee2MQTT generate a new extended panID on next startup (default: shown below)
+  ext_pan_id: GENERATE
+  # Optional: Zigbee channel, changing might require re-pairing of some devices (see docs below). (Note: use a ZLL channel: 11, 15, 20, or 25 to avoid problems)
+  # (default: 11)
+  channel: 11
+  # Optional: network encryption key
+  # GENERATE will make Zigbee2MQTT generate a new network key on next startup
+  # Note: changing requires repairing of all devices (default: shown below)
+  network_key: GENERATE
+frontend:
+  enabled: true
+  port: 8081
+  base_url: /
+homeassistant:
+  enabled: false
+onboarding: true
+availability:
+  enabled: true

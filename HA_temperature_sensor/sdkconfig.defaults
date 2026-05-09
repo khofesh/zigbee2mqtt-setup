@@ -1,0 +1,23 @@
+#
+# Partition Table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_MD5=y
+# end of Partition Table
+
+#
+# Zboss - End Device role (not coordinator/router)
+#
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZED=y
+# end of Zboss
+# end of Component config
+
+#
+# esp_timer — enable ISR dispatch so sensor_timer_isr_cb runs in
+# hardware interrupt context (SYSTIMER) rather than a helper task.
+#
+CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
