@@ -1,5 +1,15 @@
 # mqtt
 
+## requirements
+
+SONOFF Zigbee 3.0 USB Dongle Plus ZBDongle-P
+
+<img src="./images/6052922441782201845.jpg" width="20%">
+
+esp32c6 (mine is firebeetle 2 esp32c6) and aht20-f
+
+<img src="./images/6052922441782201847.jpg" width="70%">
+
 ## mqtt setup
 
 - https://randomnerdtutorials.com/how-to-install-mosquitto-broker-on-raspberry-pi/
