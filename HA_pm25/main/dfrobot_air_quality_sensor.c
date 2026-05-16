@@ -14,11 +14,34 @@ static const char *TAG = "DFROBOT_AQS";
 
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_i2c_dev;
+static uint8_t s_i2c_addr;
 
 static esp_err_t dfrobot_aqs_read_reg(uint8_t reg, uint8_t *data, size_t len)
 {
     ESP_RETURN_ON_FALSE(s_i2c_dev != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C device not initialized");
-    return i2c_master_transmit_receive(s_i2c_dev, &reg, 1, data, len, I2C_TIMEOUT_MS);
+
+    /*
+     * Match the Arduino driver:
+     *   beginTransmission(addr) -> write(reg) -> endTransmission()
+     *   requestFrom(addr, len)
+     *
+     * Some small sensor MCUs do not like combined write/read transactions with
+     * a repeated START, even when simple registers sometimes appear to work.
+     */
+    esp_err_t err = i2c_master_transmit(s_i2c_dev, &reg, 1, I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "write register address 0x%02x failed: %s", reg, esp_err_to_name(err));
+        return err;
+    }
+
+    err = i2c_master_receive(s_i2c_dev, data, len, I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "read register 0x%02x (%u bytes) failed: %s",
+                 reg, (unsigned)len, esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t dfrobot_aqs_write_reg(uint8_t reg, const uint8_t *data, size_t len)
@@ -37,8 +60,12 @@ static esp_err_t dfrobot_aqs_write_reg(uint8_t reg, const uint8_t *data, size_t 
 esp_err_t dfrobot_aqs_init(const dfrobot_aqs_config_t *config)
 {
     ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "config is NULL");
+
+    if (s_i2c_bus != NULL && s_i2c_dev != NULL) {
+        return ESP_OK;
+    }
     ESP_RETURN_ON_FALSE(s_i2c_bus == NULL && s_i2c_dev == NULL, ESP_ERR_INVALID_STATE, TAG,
-                        "already initialized");
+                        "partially initialized");
 
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = config->i2c_port,
@@ -61,6 +88,7 @@ esp_err_t dfrobot_aqs_init(const dfrobot_aqs_config_t *config)
         s_i2c_bus = NULL;
         return err;
     }
+    s_i2c_addr = config->i2c_addr;
 
     ESP_LOGI(TAG, "I2C ready: addr 0x%02x, SDA GPIO%d, SCL GPIO%d, %lu Hz",
              config->i2c_addr, config->sda_gpio, config->scl_gpio,
@@ -83,14 +111,38 @@ esp_err_t dfrobot_aqs_deinit(void)
         }
         s_i2c_bus = NULL;
     }
+    s_i2c_addr = 0;
 
     return ret;
 }
 
+esp_err_t dfrobot_aqs_scan_bus(void)
+{
+    ESP_RETURN_ON_FALSE(s_i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C bus not initialized");
+
+    bool found = false;
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        esp_err_t err = i2c_master_probe(s_i2c_bus, addr, I2C_TIMEOUT_MS);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "I2C device detected at 0x%02x%s", addr,
+                     addr == s_i2c_addr ? " (configured PM2.5 address)" : "");
+            found = true;
+        }
+    }
+
+    if (!found) {
+        ESP_LOGW(TAG, "No I2C devices detected");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t dfrobot_aqs_probe(void)
 {
-    uint8_t version;
-    return dfrobot_aqs_get_version(&version);
+    ESP_RETURN_ON_FALSE(s_i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C bus not initialized");
+    return i2c_master_probe(s_i2c_bus, s_i2c_addr, I2C_TIMEOUT_MS);
 }
 
 esp_err_t dfrobot_aqs_get_version(uint8_t *version)

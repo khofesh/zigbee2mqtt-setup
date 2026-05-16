@@ -41,6 +41,8 @@ static const char *TAG = "ZB_PM25_SENSOR";
 #define SENSOR_UPDATE_INTERVAL_MS      60000
 #define SENSOR_WAKE_STABILIZE_MS       5000
 #define ZIGBEE_SLEEP_THRESHOLD_MS      1000
+/* Keep disabled during hardware bring-up so the sensor fan/laser stays on. */
+#define SENSOR_LOW_POWER_ENABLE        0
 
 #define ESP_ZB_ZED_CONFIG()                                         \
     {                                                               \
@@ -105,11 +107,32 @@ static esp_err_t sensor_init_once(void)
         .i2c_addr = DFROBOT_AQS_DEFAULT_I2C_ADDR,
     };
     ESP_RETURN_ON_ERROR(dfrobot_aqs_init(&cfg), TAG, "sensor I2C init failed");
+    dfrobot_aqs_scan_bus();
+
+    /*
+     * If a previous firmware run put the sensor into low-power mode, wake it
+     * before doing register reads. The wake command itself is also an I2C ACK
+     * check against the configured address.
+     */
+    esp_err_t wake_err = dfrobot_aqs_wake();
+    if (wake_err != ESP_OK) {
+        ESP_LOGW(TAG, "initial sensor wake failed (%s), trying address probe",
+                 esp_err_to_name(wake_err));
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_WAKE_STABILIZE_MS));
+    }
+
+    ESP_RETURN_ON_ERROR(dfrobot_aqs_probe(), TAG,
+                        "sensor address probe failed, check wiring and address 0x19");
 
     uint8_t version = 0;
-    ESP_RETURN_ON_ERROR(dfrobot_aqs_get_version(&version), TAG,
-                        "sensor probe failed, check wiring and address 0x19");
-    ESP_LOGI(TAG, "DFRobot PM2.5 sensor firmware version: %u", version);
+    esp_err_t version_err = dfrobot_aqs_get_version(&version);
+    if (version_err == ESP_OK) {
+        ESP_LOGI(TAG, "DFRobot PM2.5 sensor firmware version: %u", version);
+    } else {
+        ESP_LOGW(TAG, "DFRobot PM2.5 version read failed (%s), continuing after address ACK",
+                 esp_err_to_name(version_err));
+    }
 
     s_sensor_ready = true;
     return ESP_OK;
@@ -143,9 +166,11 @@ static void sensor_task(void *pvParameters)
         err |= dfrobot_aqs_read_concentration_ugm3(DFROBOT_AQS_PM2_5_ATMOSPHERE, &pm2_5);
         err |= dfrobot_aqs_read_concentration_ugm3(DFROBOT_AQS_PM10_ATMOSPHERE, &pm10);
 
+#if SENSOR_LOW_POWER_ENABLE
         if (dfrobot_aqs_set_low_power() != ESP_OK) {
             ESP_LOGW(TAG, "sensor low-power command failed");
         }
+#endif
 
         if (err == ESP_OK) {
             float pm2_5_zcl = (float)pm2_5;
@@ -164,6 +189,7 @@ static void sensor_task(void *pvParameters)
                      pm1_0, pm2_5, pm10);
         } else {
             ESP_LOGE(TAG, "PM concentration read failed");
+            dfrobot_aqs_scan_bus();
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_UPDATE_INTERVAL_MS));
