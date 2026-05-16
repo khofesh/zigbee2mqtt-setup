@@ -1,8 +1,11 @@
 #include "dfrobot_air_quality_sensor.h"
 
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "DFROBOT_AQS";
 
@@ -14,6 +17,8 @@ static const char *TAG = "DFROBOT_AQS";
 
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_i2c_dev;
+static dfrobot_aqs_config_t s_i2c_cfg;
+static bool s_i2c_cfg_valid;
 static uint8_t s_i2c_addr;
 
 static esp_err_t dfrobot_aqs_read_reg(uint8_t reg, uint8_t *data, size_t len)
@@ -66,6 +71,8 @@ esp_err_t dfrobot_aqs_init(const dfrobot_aqs_config_t *config)
     }
     ESP_RETURN_ON_FALSE(s_i2c_bus == NULL && s_i2c_dev == NULL, ESP_ERR_INVALID_STATE, TAG,
                         "partially initialized");
+    s_i2c_cfg = *config;
+    s_i2c_cfg_valid = true;
 
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = config->i2c_port,
@@ -116,18 +123,47 @@ esp_err_t dfrobot_aqs_deinit(void)
     return ret;
 }
 
+static void dfrobot_aqs_log_bus_levels(const char *prefix)
+{
+    if (!s_i2c_cfg_valid) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "%s: SDA GPIO%d=%d, SCL GPIO%d=%d",
+             prefix,
+             s_i2c_cfg.sda_gpio, gpio_get_level(s_i2c_cfg.sda_gpio),
+             s_i2c_cfg.scl_gpio, gpio_get_level(s_i2c_cfg.scl_gpio));
+}
+
 esp_err_t dfrobot_aqs_scan_bus(void)
 {
     ESP_RETURN_ON_FALSE(s_i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C bus not initialized");
 
     bool found = false;
-    ESP_LOGI(TAG, "Scanning I2C bus...");
+    ESP_LOGI(TAG, "Scanning I2C bus around configured sensor address...");
+    dfrobot_aqs_log_bus_levels("Before I2C scan");
+
+    esp_err_t sensor_err = i2c_master_probe(s_i2c_bus, s_i2c_addr, I2C_TIMEOUT_MS);
+    if (sensor_err == ESP_OK) {
+        ESP_LOGI(TAG, "I2C device detected at 0x%02x (configured PM2.5 address)", s_i2c_addr);
+        return ESP_OK;
+    }
+    if (sensor_err == ESP_ERR_TIMEOUT) {
+        dfrobot_aqs_log_bus_levels("I2C probe timed out");
+        return sensor_err;
+    }
+
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (addr == s_i2c_addr) {
+            continue;
+        }
         esp_err_t err = i2c_master_probe(s_i2c_bus, addr, I2C_TIMEOUT_MS);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "I2C device detected at 0x%02x%s", addr,
-                     addr == s_i2c_addr ? " (configured PM2.5 address)" : "");
+            ESP_LOGI(TAG, "I2C device detected at 0x%02x", addr);
             found = true;
+        } else if (err == ESP_ERR_TIMEOUT) {
+            dfrobot_aqs_log_bus_levels("I2C scan timed out");
+            return err;
         }
     }
 
@@ -137,6 +173,52 @@ esp_err_t dfrobot_aqs_scan_bus(void)
     }
 
     return ESP_OK;
+}
+
+esp_err_t dfrobot_aqs_reset_bus(void)
+{
+    ESP_RETURN_ON_FALSE(s_i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C bus not initialized");
+    ESP_LOGW(TAG, "Resetting I2C bus");
+    return i2c_master_bus_reset(s_i2c_bus);
+}
+
+esp_err_t dfrobot_aqs_recover_bus(void)
+{
+    ESP_RETURN_ON_FALSE(s_i2c_cfg_valid, ESP_ERR_INVALID_STATE, TAG, "I2C config not initialized");
+
+    ESP_LOGW(TAG, "Recovering I2C bus by clocking SCL manually");
+    dfrobot_aqs_deinit();
+
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << s_i2c_cfg.sda_gpio) | (1ULL << s_i2c_cfg.scl_gpio),
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "GPIO config for I2C recovery failed");
+
+    gpio_set_level(s_i2c_cfg.sda_gpio, 1);
+    gpio_set_level(s_i2c_cfg.scl_gpio, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(s_i2c_cfg.scl_gpio, 0);
+        vTaskDelay(pdMS_TO_TICKS(1));
+        gpio_set_level(s_i2c_cfg.scl_gpio, 1);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    /* Generate a STOP condition: SDA low while SCL high, then SDA high. */
+    gpio_set_level(s_i2c_cfg.sda_gpio, 0);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    gpio_set_level(s_i2c_cfg.scl_gpio, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    gpio_set_level(s_i2c_cfg.sda_gpio, 1);
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    dfrobot_aqs_log_bus_levels("After manual I2C recovery");
+    return dfrobot_aqs_init(&s_i2c_cfg);
 }
 
 esp_err_t dfrobot_aqs_probe(void)

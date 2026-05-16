@@ -3,11 +3,10 @@
  * Target: Waveshare ESP32-C6-DEV-KIT-N8
  *
  * Sensor: DFRobot Gravity PM2.5 Air Quality Sensor (SEN0460)
- * I2C:    SDA GPIO6, SCL GPIO7 (LP-capable pins on the Waveshare board)
+ * I2C:    SDA GPIO22, SCL GPIO23 (working bring-up pins on this board)
  *
- * The sensor and Zigbee stack sleep between samples. I2C transactions happen
- * only while the CPU is awake; the sensor is returned to its own low-power mode
- * after each report.
+ * The Zigbee end device can sleep between samples. The sensor low-power command
+ * is disabled because this module did not reliably wake from that state.
  */
 
 #include "freertos/FreeRTOS.h"
@@ -27,22 +26,39 @@
 static const char *TAG = "ZB_PM25_SENSOR";
 
 #define INSTALLCODE_POLICY_ENABLE      false
-#define SENSOR_ENDPOINT                1
+#define PM25_ENDPOINT                  1
+#define PM1_ENDPOINT                   2
+#define PM10_ENDPOINT                  3
 #define ESP_ZB_PRIMARY_CHANNEL_MASK    (1l << 11)
 
 #define ESP_MANUFACTURER_NAME          "\x09""ESPRESSIF"
 #define ESP_MODEL_IDENTIFIER           "\x07"CONFIG_IDF_TARGET
 
 #define PM25_I2C_PORT                  I2C_NUM_0
+/*
+ * GPIO6/GPIO7 are LP-I2C-capable, but if SCL reads stuck low on your board,
+ * move the sensor wires and set PM25_USE_ALT_I2C_PINS to 1 for bring-up.
+ */
+#define PM25_USE_ALT_I2C_PINS          1
+#if PM25_USE_ALT_I2C_PINS
+#define PM25_I2C_SDA_GPIO              22
+#define PM25_I2C_SCL_GPIO              23
+#else
 #define PM25_I2C_SDA_GPIO              6
 #define PM25_I2C_SCL_GPIO              7
+#endif
 #define PM25_I2C_SPEED_HZ              100000
 
 #define SENSOR_UPDATE_INTERVAL_MS      60000
+#define SENSOR_STARTUP_DELAY_MS        30000
+#define SENSOR_INIT_RETRY_MS           10000
 #define SENSOR_WAKE_STABILIZE_MS       5000
 #define ZIGBEE_SLEEP_THRESHOLD_MS      1000
-/* Keep disabled during hardware bring-up so the sensor fan/laser stays on. */
+/* Keep disabled because this sensor did not reliably wake from low-power mode. */
 #define SENSOR_LOW_POWER_ENABLE        0
+
+static uint8_t s_pm1_description[] = "\x05""PM1.0";
+static uint8_t s_pm10_description[] = "\x04""PM10";
 
 #define ESP_ZB_ZED_CONFIG()                                         \
     {                                                               \
@@ -75,7 +91,7 @@ static void configure_attribute_reporting(void)
 
     esp_zb_zcl_reporting_info_t pm25_report = {
         .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-        .ep = SENSOR_ENDPOINT,
+        .ep = PM25_ENDPOINT,
         .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
         .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         .attr_id = ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
@@ -89,8 +105,40 @@ static void configure_attribute_reporting(void)
     };
     esp_zb_zcl_update_reporting_info(&pm25_report);
 
+    esp_zb_zcl_reporting_info_t pm1_report = {
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+        .ep = PM1_ENDPOINT,
+        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .attr_id = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        .u.send_info = {
+            .min_interval = 10,
+            .max_interval = 60,
+            .delta.f32 = 1.0f,
+        },
+        .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+    };
+    esp_zb_zcl_update_reporting_info(&pm1_report);
+
+    esp_zb_zcl_reporting_info_t pm10_report = {
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+        .ep = PM10_ENDPOINT,
+        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .attr_id = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        .u.send_info = {
+            .min_interval = 10,
+            .max_interval = 60,
+            .delta.f32 = 1.0f,
+        },
+        .dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+    };
+    esp_zb_zcl_update_reporting_info(&pm10_report);
+
     s_reporting_configured = true;
-    ESP_LOGI(TAG, "PM2.5 attribute reporting configured, max interval 60 s");
+    ESP_LOGI(TAG, "PM1.0, PM2.5, and PM10 reporting configured, max interval 60 s");
 }
 
 static esp_err_t sensor_init_once(void)
@@ -107,7 +155,11 @@ static esp_err_t sensor_init_once(void)
         .i2c_addr = DFROBOT_AQS_DEFAULT_I2C_ADDR,
     };
     ESP_RETURN_ON_ERROR(dfrobot_aqs_init(&cfg), TAG, "sensor I2C init failed");
-    dfrobot_aqs_scan_bus();
+    esp_err_t scan_err = dfrobot_aqs_scan_bus();
+    if (scan_err != ESP_OK) {
+        dfrobot_aqs_recover_bus();
+        return scan_err;
+    }
 
     /*
      * If a previous firmware run put the sensor into low-power mode, wake it
@@ -143,16 +195,21 @@ static void sensor_task(void *pvParameters)
     (void)pvParameters;
     TickType_t last_wake = xTaskGetTickCount();
 
+    ESP_LOGI(TAG, "Waiting %u ms for PM sensor startup", SENSOR_STARTUP_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_STARTUP_DELAY_MS));
+    last_wake = xTaskGetTickCount();
+
     while (1) {
         if (sensor_init_once() != ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_INIT_RETRY_MS));
             last_wake = xTaskGetTickCount();
             continue;
         }
 
         if (dfrobot_aqs_wake() != ESP_OK) {
             ESP_LOGW(TAG, "sensor wake failed");
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            dfrobot_aqs_recover_bus();
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_INIT_RETRY_MS));
             last_wake = xTaskGetTickCount();
             continue;
         }
@@ -173,15 +230,31 @@ static void sensor_task(void *pvParameters)
 #endif
 
         if (err == ESP_OK) {
+            float pm1_zcl = (float)pm1_0;
             float pm2_5_zcl = (float)pm2_5;
+            float pm10_zcl = (float)pm10;
 
             esp_zb_lock_acquire(portMAX_DELAY);
             esp_zb_zcl_set_attribute_val(
-                SENSOR_ENDPOINT,
+                PM25_ENDPOINT,
                 ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                 ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID,
                 &pm2_5_zcl,
+                false);
+            esp_zb_zcl_set_attribute_val(
+                PM1_ENDPOINT,
+                ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+                &pm1_zcl,
+                false);
+            esp_zb_zcl_set_attribute_val(
+                PM10_ENDPOINT,
+                ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+                &pm10_zcl,
                 false);
             esp_zb_lock_release();
 
@@ -278,18 +351,18 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
 
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-
     esp_zb_basic_cluster_cfg_t basic_cfg = {
         .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
         .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_BATTERY,
     };
-    esp_zb_cluster_list_add_basic_cluster(cluster_list,
-                                          esp_zb_basic_cluster_create(&basic_cfg),
-                                          ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_identify_cluster_cfg_t identify_cfg = { .identify_time = 0 };
-    esp_zb_cluster_list_add_identify_cluster(cluster_list,
+
+    esp_zb_cluster_list_t *pm25_cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_basic_cluster(pm25_cluster_list,
+                                          esp_zb_basic_cluster_create(&basic_cfg),
+                                          ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_identify_cluster(pm25_cluster_list,
                                              esp_zb_identify_cluster_create(&identify_cfg),
                                              ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
@@ -299,24 +372,66 @@ static void esp_zb_task(void *pvParameters)
         .max_measured_value = 1000.0f,
     };
     esp_zb_cluster_list_add_pm2_5_measurement_cluster(
-        cluster_list,
+        pm25_cluster_list,
         esp_zb_pm2_5_measurement_cluster_create(&pm25_cfg),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    esp_zb_endpoint_config_t ep_config = {
-        .endpoint = SENSOR_ENDPOINT,
+    esp_zb_endpoint_config_t pm25_ep_config = {
+        .endpoint = PM25_ENDPOINT,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
         .app_device_version = 0,
     };
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
-    esp_zb_ep_list_add_ep(ep_list, cluster_list, ep_config);
+    esp_zb_ep_list_add_ep(ep_list, pm25_cluster_list, pm25_ep_config);
+
+    esp_zb_analog_input_cluster_cfg_t pm1_cfg = {
+        .out_of_service = false,
+        .present_value = ESP_ZB_ZCL_VALUE_SINGLE_NONE,
+        .status_flags = ESP_ZB_ZCL_ANALOG_INPUT_STATUS_FLAG_NORMAL,
+    };
+    esp_zb_attribute_list_t *pm1_analog_cluster = esp_zb_analog_input_cluster_create(&pm1_cfg);
+    esp_zb_analog_input_cluster_add_attr(pm1_analog_cluster,
+                                         ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID,
+                                         s_pm1_description);
+    esp_zb_cluster_list_t *pm1_cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_analog_input_cluster(pm1_cluster_list,
+                                                 pm1_analog_cluster,
+                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_endpoint_config_t pm1_ep_config = {
+        .endpoint = PM1_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, pm1_cluster_list, pm1_ep_config);
+
+    esp_zb_analog_input_cluster_cfg_t pm10_cfg = {
+        .out_of_service = false,
+        .present_value = ESP_ZB_ZCL_VALUE_SINGLE_NONE,
+        .status_flags = ESP_ZB_ZCL_ANALOG_INPUT_STATUS_FLAG_NORMAL,
+    };
+    esp_zb_attribute_list_t *pm10_analog_cluster = esp_zb_analog_input_cluster_create(&pm10_cfg);
+    esp_zb_analog_input_cluster_add_attr(pm10_analog_cluster,
+                                         ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID,
+                                         s_pm10_description);
+    esp_zb_cluster_list_t *pm10_cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_analog_input_cluster(pm10_cluster_list,
+                                                 pm10_analog_cluster,
+                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_endpoint_config_t pm10_ep_config = {
+        .endpoint = PM10_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, pm10_cluster_list, pm10_ep_config);
 
     zcl_basic_manufacturer_info_t info = {
         .manufacturer_name = ESP_MANUFACTURER_NAME,
         .model_identifier = ESP_MODEL_IDENTIFIER,
     };
-    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, SENSOR_ENDPOINT, &info);
+    esp_zcl_utility_add_ep_basic_manufacturer_info(ep_list, PM25_ENDPOINT, &info);
 
     esp_zb_device_register(ep_list);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);

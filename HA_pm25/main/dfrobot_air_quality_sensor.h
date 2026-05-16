@@ -44,6 +44,8 @@ typedef struct {
 esp_err_t dfrobot_aqs_init(const dfrobot_aqs_config_t *config);
 esp_err_t dfrobot_aqs_deinit(void);
 esp_err_t dfrobot_aqs_scan_bus(void);
+esp_err_t dfrobot_aqs_reset_bus(void);
+esp_err_t dfrobot_aqs_recover_bus(void);
 esp_err_t dfrobot_aqs_probe(void);
 esp_err_t dfrobot_aqs_get_version(uint8_t *version);
 esp_err_t dfrobot_aqs_set_low_power(void);
