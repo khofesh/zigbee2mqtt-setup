@@ -32,7 +32,7 @@ static const char *TAG = "ZB_PM25_SENSOR";
 #define ESP_ZB_PRIMARY_CHANNEL_MASK    (1l << 11)
 
 #define ESP_MANUFACTURER_NAME          "\x09""ESPRESSIF"
-#define ESP_MODEL_IDENTIFIER           "\x07"CONFIG_IDF_TARGET
+#define ESP_MODEL_IDENTIFIER           "\x0c""ESP32C6_PM25"
 
 #define PM25_I2C_PORT                  I2C_NUM_0
 /*
@@ -82,6 +82,29 @@ static uint8_t s_pm10_description[] = "\x04""PM10";
 
 static bool s_sensor_ready;
 static bool s_reporting_configured;
+
+static void report_attribute_to_coordinator(uint8_t endpoint, uint16_t cluster_id, uint16_t attr_id)
+{
+    esp_zb_zcl_report_attr_cmd_t report_cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = 0x0000,
+            .dst_endpoint = 1,
+            .src_endpoint = endpoint,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = cluster_id,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        .dis_default_resp = 1,
+        .manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+        .attributeID = attr_id,
+    };
+
+    esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_cmd);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "attribute report failed: endpoint %u cluster 0x%04x attr 0x%04x (%s)",
+                 endpoint, cluster_id, attr_id, esp_err_to_name(err));
+    }
+}
 
 static void configure_attribute_reporting(void)
 {
@@ -256,6 +279,18 @@ static void sensor_task(void *pvParameters)
                 ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
                 &pm10_zcl,
                 false);
+            report_attribute_to_coordinator(
+                PM25_ENDPOINT,
+                ESP_ZB_ZCL_CLUSTER_ID_PM2_5_MEASUREMENT,
+                ESP_ZB_ZCL_ATTR_PM2_5_MEASUREMENT_MEASURED_VALUE_ID);
+            report_attribute_to_coordinator(
+                PM1_ENDPOINT,
+                ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
+            report_attribute_to_coordinator(
+                PM10_ENDPOINT,
+                ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
             esp_zb_lock_release();
 
             ESP_LOGI(TAG, "PM1.0: %u ug/m3  PM2.5: %u ug/m3  PM10: %u ug/m3",

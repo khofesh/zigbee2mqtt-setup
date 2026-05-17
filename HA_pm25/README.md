@@ -35,6 +35,14 @@ The firmware registers one Zigbee end device with three measurement values:
 - Endpoint `2`: Analog Input cluster, PM1.0 value
 - Endpoint `3`: Analog Input cluster, PM10 value
 
+Zigbee2MQTT's default/generated support may only show PM2.5 in the Exposes tab. To show all three values in the dashboard, install the external converter in:
+
+```text
+zigbee2mqtt/esp32c6_dfrobot_pm25.mjs
+```
+
+Copy it to Zigbee2MQTT's `external_converters` directory or add it from the Zigbee2MQTT UI at Settings -> Dev console -> External converters, then restart Zigbee2MQTT. If the device was already interviewed before this model string changed, remove and re-pair it so Zigbee2MQTT sees model `ESP32C6_PM25`.
+
 The sensor is read every 60 seconds. Logs should look like:
 
 ```text
